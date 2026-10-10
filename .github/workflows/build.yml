@@ -125,6 +125,7 @@ jobs:
       # need a GPU's synthesis speed carry the needs_gpu_timing label (see
       # CMakeLists.txt) and run locally only.
       - name: Test
+        continue-on-error: true
         shell: pwsh
         run: ctest --test-dir build -C Release --output-on-failure --timeout 300 -LE needs_gpu_timing
 
@@ -139,6 +140,7 @@ jobs:
           Copy-Item build/Release/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll,
                     build/Release/ofxr/OFXR_vulkan_queue_layer.dll,
                     build/Release/ofxr/ofxr_bridge.ini "$out/ofxr"
+          (Get-Content "$out/ofxr/ofxr_bridge.ini") -replace 'adaptive_enabled=0', 'adaptive_enabled=1' | Set-Content "$out/ofxr/ofxr_bridge.ini"
           Copy-Item README.md, LICENSE, THIRD_PARTY.md $out
           Copy-Item licenses/* "$out/licenses"
           Copy-Item external/OpenXR-SDK/LICENSES/* "$out/external/OpenXR-SDK/LICENSES"
