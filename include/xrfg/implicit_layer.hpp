@@ -189,6 +189,19 @@ private:
 [[nodiscard]] ConfiguredNvidiaOptions read_nvidia_options(
     const std::filesystem::path& module_directory) noexcept;
 
+struct AdaptiveSettings {
+    bool enabled{false};
+    float target_fps{90.0f};
+    float drop_threshold_fps{87.0f};
+    std::uint32_t drop_streak{4};
+    float recovery_headroom_ms{3.0f};
+    std::uint32_t recovery_delay_ms{3000};
+    bool allow_triple{false};
+};
+
+[[nodiscard]] AdaptiveSettings read_adaptive_settings(
+    const std::filesystem::path& module_directory) noexcept;
+
 [[nodiscard]] bool register_manifest(
     const std::filesystem::path& manifest,
     RegistryScope scope,

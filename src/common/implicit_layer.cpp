@@ -324,6 +324,49 @@ bool read_capture_at_end_frame(
     }
 }
 
+AdaptiveSettings read_adaptive_settings(
+    const std::filesystem::path& module_directory) noexcept {
+    AdaptiveSettings settings;
+    try {
+        if (module_directory.empty()) {
+            return settings;
+        }
+        const auto ini_path = module_directory / L"ofxr_bridge.ini";
+        settings.enabled = GetPrivateProfileIntW(
+            L"adaptive", L"adaptive_enabled", 0, ini_path.c_str()) != 0;
+
+        int target = GetPrivateProfileIntW(
+            L"adaptive", L"target_fps", 90, ini_path.c_str());
+        if (target > 0) {
+            settings.target_fps = static_cast<float>(target);
+        }
+
+        int drop = GetPrivateProfileIntW(
+            L"adaptive", L"drop_threshold_fps", 87, ini_path.c_str());
+        if (drop > 0) {
+            settings.drop_threshold_fps = static_cast<float>(drop);
+        }
+
+        settings.drop_streak = static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"adaptive", L"drop_frame_count", 4, ini_path.c_str()));
+
+        int headroom = GetPrivateProfileIntW(
+            L"adaptive", L"recovery_headroom_ms", 3, ini_path.c_str());
+        if (headroom > 0) {
+            settings.recovery_headroom_ms = static_cast<float>(headroom);
+        }
+
+        settings.recovery_delay_ms = static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"adaptive", L"recovery_delay_ms", 3000, ini_path.c_str()));
+
+        settings.allow_triple = GetPrivateProfileIntW(
+            L"adaptive", L"allow_triple", 0, ini_path.c_str()) != 0;
+    } catch (...) {
+    }
+    return settings;
+}
+
+
 std::vector<std::wstring> read_excluded_processes(
     const std::filesystem::path& module_directory) noexcept {
     std::vector<std::wstring> names;

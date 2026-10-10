@@ -830,6 +830,18 @@ struct SessionState {
     // xrEndFrame knows to look for depth information naming one. Never
     // cleared: a strip on a frame that names none is a cheap walk.
     std::atomic<bool> has_private_depth_swapchain{false};
+    struct AdaptiveControllerState {
+        xrfg::implicit_layer::AdaptiveSettings settings{};
+        std::atomic<bool> generation_active{false};
+        std::chrono::steady_clock::time_point wait_returned_at{};
+        std::chrono::steady_clock::time_point last_end_frame_at{};
+        std::chrono::steady_clock::time_point last_state_transition_at{};
+        std::uint32_t slow_frame_streak{0};
+        std::chrono::nanoseconds recovery_headroom_streak{};
+        float runtime_detected_fps{90.0f};
+        bool runtime_fps_detected{false};
+    };
+    AdaptiveControllerState adaptive_controller;
     // Application frames submitted on this session, counted only until the
     // delivery connection is released. Guarded by frame_call_mutex.
     std::uint32_t application_frames_submitted{};
@@ -4771,6 +4783,11 @@ XrResult layer_create_session_impl(
         xrfg::implicit_layer::read_capture_at_end_frame(current_layer_directory());
     state->vulkan_support =
         xrfg::implicit_layer::read_vulkan_support(current_layer_directory());
+    state->adaptive_controller.settings =
+        xrfg::implicit_layer::read_adaptive_settings(current_layer_directory());
+    if (!state->adaptive_controller.settings.enabled) {
+        state->adaptive_controller.generation_active.store(true);
+    }
     state->pause_applied = state->manual_control.pause_requested();
     state->recorder_applied = xrfg::bridge_flight_logger().enabled();
     state->menu_enabled = initial_control.desired.enabled && !state->pause_applied;
@@ -5405,7 +5422,11 @@ XrResult layer_wait_frame_impl(
             state->presenter_stop_requested) {
             return XR_ERROR_SESSION_NOT_RUNNING;
         }
-        const XrDuration virtual_period = (state->manual_control.stop_requested() || !state->menu_enabled)
+        const bool generate = !state->manual_control.stop_requested() &&
+            state->menu_enabled &&
+            (!state->adaptive_controller.settings.enabled ||
+             state->adaptive_controller.generation_active.load());
+        const XrDuration virtual_period = !generate
             ? state->presenter_frame_state.predictedDisplayPeriod
             : virtual_display_period(
                 state->presenter_frame_state.predictedDisplayPeriod,
@@ -5480,7 +5501,11 @@ XrResult layer_wait_frame_impl(
             frame_state->type != XR_TYPE_FRAME_STATE) {
             return XR_ERROR_VALIDATION_FAILURE;
         }
-        const XrDuration virtual_period = (state->manual_control.stop_requested() || !state->menu_enabled)
+        const bool generate_provisional = !state->manual_control.stop_requested() &&
+            state->menu_enabled &&
+            (!state->adaptive_controller.settings.enabled ||
+             state->adaptive_controller.generation_active.load());
+        const XrDuration virtual_period = !generate_provisional
             ? state->last_inline_frame_state.predictedDisplayPeriod
             : virtual_display_period(
                 state->last_inline_frame_state.predictedDisplayPeriod,
@@ -5602,6 +5627,14 @@ XrResult layer_wait_frame_impl(
         constexpr std::size_t kMaximumPendingFrameRecords = 32;
         while (state->pending_frames.size() > kMaximumPendingFrameRecords) {
             state->pending_frames.pop_front();
+        }
+        state->adaptive_controller.wait_returned_at = std::chrono::steady_clock::now();
+        if (frame_state->predictedDisplayPeriod > 0) {
+            const float detected_fps = 1e9f / static_cast<float>(frame_state->predictedDisplayPeriod);
+            if (detected_fps > 30.0f && detected_fps < 250.0f) {
+                state->adaptive_controller.runtime_detected_fps = detected_fps;
+                state->adaptive_controller.runtime_fps_detected = true;
+            }
         }
     }
     return result;
@@ -10391,6 +10424,7 @@ enum class GenerationPrepareReason : std::int64_t {
     // a begin that cannot come before this call returns. Passed through;
     // see SessionState::runtime_frame_waited_unbegun.
     inline_wait_outstanding = 21,
+    adaptive_native_bypass = 22,
 };
 
 [[nodiscard]] constexpr GenerationPrepareReason classify_synthesis_failure(
@@ -11843,6 +11877,93 @@ void apply_live_frame_multiplier(
     }
 }
 
+void update_adaptive_frame_gen(
+    const std::shared_ptr<SessionState>& state,
+    bool /*use_continuous_presenter*/) noexcept {
+    try {
+        if (!state || !state->adaptive_controller.settings.enabled) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        auto& controller = state->adaptive_controller;
+        const auto& settings = controller.settings;
+
+        float target_fps = settings.target_fps;
+        if (target_fps <= 0.0f) {
+            target_fps = controller.runtime_fps_detected ? controller.runtime_detected_fps : 90.0f;
+        }
+        const float drop_fps = settings.drop_threshold_fps > 0.0f ? settings.drop_threshold_fps : (target_fps - 3.0f);
+        const double target_period_sec = 1.0 / static_cast<double>(target_fps);
+        const double drop_period_sec = 1.0 / static_cast<double>(drop_fps);
+        const auto drop_threshold_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(drop_period_sec));
+        const auto target_period_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(target_period_sec));
+
+        if (controller.last_end_frame_at != std::chrono::steady_clock::time_point{}) {
+            const auto frame_interval = now - controller.last_end_frame_at;
+            const auto render_work = (controller.wait_returned_at != std::chrono::steady_clock::time_point{} && now >= controller.wait_returned_at)
+                ? (now - controller.wait_returned_at)
+                : frame_interval;
+
+            // If currently in Native 1X mode (generation_active == false):
+            if (!controller.generation_active.load()) {
+                if (frame_interval > drop_threshold_duration) {
+                    controller.slow_frame_streak++;
+                    if (controller.slow_frame_streak >= settings.drop_streak) {
+                        // Native performance dropped below threshold -> engage Frame Gen!
+                        controller.generation_active.store(true);
+                        controller.last_state_transition_at = now;
+                        controller.slow_frame_streak = 0;
+                        controller.recovery_headroom_streak = std::chrono::nanoseconds::zero();
+                        clear_generation_continuity(state);
+                        xrfg::bridge_flight_logger().event(
+                            xrfg::BridgeFlightOperation::presenter_transition,
+                            801,
+                            state->frames_per_application_frame.load(),
+                            1,
+                            0);
+                    }
+                } else {
+                    controller.slow_frame_streak = 0;
+                }
+            } else {
+                // Currently in 2X Frame Gen mode (generation_active == true):
+                // Check if game render work time fits within native target budget minus recovery headroom
+                const auto headroom_budget = target_period_duration - 
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::duration<double>(settings.recovery_headroom_ms / 1000.0));
+
+                const auto time_in_state = now - controller.last_state_transition_at;
+                const auto min_hold_duration = std::chrono::milliseconds(2000);
+
+                if (render_work <= headroom_budget) {
+                    controller.recovery_headroom_streak += frame_interval;
+                    if (controller.recovery_headroom_streak >= std::chrono::milliseconds(settings.recovery_delay_ms) &&
+                        time_in_state >= min_hold_duration) {
+                        // Headroom sustained -> return to Native 1X bypass!
+                        controller.generation_active.store(false);
+                        controller.last_state_transition_at = now;
+                        controller.slow_frame_streak = 0;
+                        controller.recovery_headroom_streak = std::chrono::nanoseconds::zero();
+                        clear_generation_continuity(state);
+                        xrfg::bridge_flight_logger().event(
+                            xrfg::BridgeFlightOperation::presenter_transition,
+                            802,
+                            state->frames_per_application_frame.load(),
+                            0,
+                            0);
+                    }
+                } else {
+                    controller.recovery_headroom_streak = std::chrono::nanoseconds::zero();
+                }
+            }
+        }
+        controller.last_end_frame_at = now;
+    } catch (...) {
+    }
+}
+
 // projection_view_rect, for every view whose rectangle or array index
 // differs from the last record for its swapchain.
 void log_projection_view_rects(
@@ -11982,6 +12103,7 @@ XrResult layer_end_frame_impl(
     };
 
     apply_live_frame_multiplier(state, use_continuous_presenter);
+    update_adaptive_frame_gen(state, use_continuous_presenter);
     log_video_memory_periodically(*state);
     apply_embedded_control(state, use_continuous_presenter);
     const bool manually_disarmed = state->manual_control.stop_requested();
@@ -12122,13 +12244,17 @@ XrResult layer_end_frame_impl(
             }
         }
     }
-    if (generation_cooling_down || manually_disarmed || !state->menu_enabled) {
+    const bool adaptive_active = !state->adaptive_controller.settings.enabled ||
+        state->adaptive_controller.generation_active.load();
+    if (generation_cooling_down || manually_disarmed || !state->menu_enabled || !adaptive_active) {
         return bypass_generation(
             manually_disarmed
                 ? GenerationPrepareReason::manual_disarmed
-                : structural_quarantine_active
-                    ? GenerationPrepareReason::structural_quarantine_active
-                    : GenerationPrepareReason::cooldown_active);
+                : !adaptive_active
+                    ? GenerationPrepareReason::adaptive_native_bypass
+                    : structural_quarantine_active
+                        ? GenerationPrepareReason::structural_quarantine_active
+                        : GenerationPrepareReason::cooldown_active);
     }
 
     ProjectionSnapshot current_snapshot{};
